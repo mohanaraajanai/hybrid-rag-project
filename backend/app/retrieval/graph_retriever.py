@@ -1,13 +1,29 @@
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 from app.knowledge_graph.neo4j_connection import Neo4jConnection
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+VECTOR_METADATA_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "vector_store"
+    / "documents_metadata.json"
+)
+
+
 class GraphRetriever:
     """
-    Retrieves entities, relationships, and source chunks
-    from the isolated Hybrid RAG knowledge graph.
+    Retrieves graph context for the same document corpus represented
+    by the active FAISS vector index.
+
+    The FAISS metadata file is used to determine which document IDs
+    should be searched in Neo4j. This prevents older documents already
+    stored in Neo4j from contaminating the current Hybrid RAG result.
     """
 
     STOPWORDS = {
@@ -41,10 +57,10 @@ class GraphRetriever:
         "those",
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.connection = Neo4jConnection()
 
-    def close(self):
+    def close(self) -> None:
         self.connection.close()
 
     def extract_terms(self, query: str) -> list[str]:
@@ -53,15 +69,48 @@ class GraphRetriever:
         if not query or not query.strip():
             raise ValueError("Graph retrieval query cannot be empty.")
 
-        words = re.findall(r"[a-zA-Z0-9+#.-]+", query.lower())
+        words = re.findall(
+            r"[a-zA-Z0-9+#.-]+",
+            query.lower(),
+        )
 
         terms = [
             word
             for word in words
-            if len(word) >= 3 and word not in self.STOPWORDS
+            if len(word) >= 3
+            and word not in self.STOPWORDS
         ]
 
         return list(dict.fromkeys(terms))
+
+    def _get_active_document_ids(self) -> list[str]:
+        """
+        Read document IDs represented by the active FAISS metadata.
+
+        The current FAISS build represents the document corpus used by
+        vector retrieval. Graph retrieval should use the same corpus.
+        """
+
+        if not VECTOR_METADATA_PATH.exists():
+            return []
+
+        try:
+            metadata = json.loads(
+                VECTOR_METADATA_PATH.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        document_ids = {
+            str(item.get("document_id"))
+            for item in metadata
+            if isinstance(item, dict)
+            and item.get("document_id")
+        }
+
+        return sorted(document_ids)
 
     def _format_records(
         self,
@@ -71,9 +120,9 @@ class GraphRetriever:
     ) -> dict[str, Any]:
         """Convert Neo4j records into a consistent response structure."""
 
-        entities = []
-        relationships = []
-        chunks_by_id = {}
+        entities: list[dict[str, Any]] = []
+        relationships: list[dict[str, Any]] = []
+        chunks_by_id: dict[str, dict[str, Any]] = {}
 
         for record in records:
             entity_name = record.get("entity_name")
@@ -89,8 +138,12 @@ class GraphRetriever:
                 }
             )
 
-            for relationship in record.get("relationships", []):
-                related_entity = relationship.get("related_entity")
+            for relationship in (
+                record.get("relationships") or []
+            ):
+                related_entity = relationship.get(
+                    "related_entity"
+                )
 
                 if related_entity:
                     relationships.append(
@@ -103,15 +156,31 @@ class GraphRetriever:
                         }
                     )
 
-            for chunk in record.get("chunks", []):
+            for chunk in record.get("chunks") or []:
                 chunk_id = chunk.get("chunk_id")
 
-                if chunk_id and chunk_id not in chunks_by_id:
-                    chunks_by_id[chunk_id] = {
-                        "chunk_id": chunk_id,
-                        "page_number": chunk.get("page_number"),
-                        "text": chunk.get("text"),
-                    }
+                if not chunk_id:
+                    continue
+
+                if chunk_id in chunks_by_id:
+                    continue
+
+                chunks_by_id[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "document_id": chunk.get(
+                        "document_id"
+                    ),
+                    "filename": chunk.get(
+                        "filename"
+                    ),
+                    "page_number": chunk.get(
+                        "page_number"
+                    ),
+                    "page_chunk_index": chunk.get(
+                        "page_chunk_index"
+                    ),
+                    "text": chunk.get("text"),
+                }
 
         return {
             "query": query,
@@ -128,11 +197,8 @@ class GraphRetriever:
         max_chunks: int = 10,
     ) -> dict[str, Any]:
         """
-        Retrieve graph context.
-
-        First attempts keyword-based entity matching.
-        If no entities are found, falls back to retrieving
-        entities from the stored HybridDocument graph.
+        Retrieve graph context restricted to the documents represented
+        by the active FAISS metadata.
         """
 
         terms = self.extract_terms(query)
@@ -146,12 +212,17 @@ class GraphRetriever:
                 "chunks": [],
             }
 
+        active_document_ids = (
+            self._get_active_document_ids()
+        )
+
         # --------------------------------------------------
         # Strategy 1: Keyword-based entity retrieval
         # --------------------------------------------------
 
         entity_query = """
         MATCH (entity:HybridEntity)
+
         WHERE any(
             term IN $terms
             WHERE
@@ -159,9 +230,33 @@ class GraphRetriever:
                 OR term CONTAINS toLower(entity.name)
         )
 
-        OPTIONAL MATCH (chunk:HybridChunk)-[:MENTIONS_HYBRID_ENTITY]->(entity)
+        AND (
+            size($document_ids) = 0
+            OR EXISTS {
+                MATCH (scoped_chunk:HybridChunk)
+                    -[:MENTIONS_HYBRID_ENTITY]->(entity)
+                WHERE scoped_chunk.document_id IN $document_ids
+            }
+        )
 
-        OPTIONAL MATCH (entity)-[relationship]-(related:HybridEntity)
+        OPTIONAL MATCH
+            (chunk:HybridChunk)
+            -[:MENTIONS_HYBRID_ENTITY]->(entity)
+
+        WHERE
+            size($document_ids) = 0
+            OR chunk.document_id IN $document_ids
+
+        OPTIONAL MATCH
+            (entity)-[relationship]-(related:HybridEntity)
+
+        WHERE
+            size($document_ids) = 0
+            OR EXISTS {
+                MATCH (related_chunk:HybridChunk)
+                    -[:MENTIONS_HYBRID_ENTITY]->(related)
+                WHERE related_chunk.document_id IN $document_ids
+            }
 
         RETURN
             entity.entity_id AS entity_id,
@@ -170,7 +265,10 @@ class GraphRetriever:
 
             collect(DISTINCT {
                 chunk_id: chunk.chunk_id,
+                document_id: chunk.document_id,
+                filename: chunk.filename,
                 page_number: chunk.page_number,
+                page_chunk_index: chunk.page_chunk_index,
                 text: chunk.text
             }) AS chunks,
 
@@ -187,24 +285,49 @@ class GraphRetriever:
             entity_query,
             {
                 "terms": terms,
+                "document_ids": active_document_ids,
                 "max_entities": max_entities,
             },
         )
 
-        result = self._format_records(records, query, terms)
+        result = self._format_records(
+            records,
+            query,
+            terms,
+        )
 
         if result["entities"]:
-            result["chunks"] = result["chunks"][:max_chunks]
+            result["chunks"] = (
+                result["chunks"][:max_chunks]
+            )
+
             return result
 
         # --------------------------------------------------
-        # Strategy 2: Fallback graph retrieval
+        # Strategy 2: Scoped fallback graph retrieval
         # --------------------------------------------------
 
         fallback_query = """
         MATCH (chunk:HybridChunk)
-        OPTIONAL MATCH (chunk)-[:MENTIONS_HYBRID_ENTITY]->(entity:HybridEntity)
-        OPTIONAL MATCH (entity)-[relationship]-(related:HybridEntity)
+
+        WHERE
+            size($document_ids) = 0
+            OR chunk.document_id IN $document_ids
+
+        OPTIONAL MATCH
+            (chunk)-[:MENTIONS_HYBRID_ENTITY]->(entity:HybridEntity)
+
+        OPTIONAL MATCH
+            (entity)-[relationship]-(related:HybridEntity)
+
+        WHERE
+            size($document_ids) = 0
+            OR related IS NULL
+            OR EXISTS {
+                MATCH (related_chunk:HybridChunk)
+                    -[:MENTIONS_HYBRID_ENTITY]->(related)
+                WHERE related_chunk.document_id IN $document_ids
+            }
 
         RETURN
             entity.entity_id AS entity_id,
@@ -213,7 +336,10 @@ class GraphRetriever:
 
             collect(DISTINCT {
                 chunk_id: chunk.chunk_id,
+                document_id: chunk.document_id,
+                filename: chunk.filename,
                 page_number: chunk.page_number,
+                page_chunk_index: chunk.page_chunk_index,
                 text: chunk.text
             }) AS chunks,
 
@@ -229,6 +355,7 @@ class GraphRetriever:
         fallback_records = self.connection.execute_query(
             fallback_query,
             {
+                "document_ids": active_document_ids,
                 "max_entities": max_entities,
             },
         )
@@ -239,6 +366,8 @@ class GraphRetriever:
             terms,
         )
 
-        fallback_result["chunks"] = fallback_result["chunks"][:max_chunks]
+        fallback_result["chunks"] = (
+            fallback_result["chunks"][:max_chunks]
+        )
 
         return fallback_result

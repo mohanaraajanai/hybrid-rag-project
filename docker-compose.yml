@@ -13,7 +13,7 @@ services:
       --port 8001
 
     ports:
-      - "8001:8001"
+      - "8002:8001"
 
     env_file:
       - .env
@@ -40,7 +40,16 @@ services:
       --server.port=8501
 
     ports:
-      - "8501:8501"
+      - "8502:8501"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=hybrid-rag-project_default"
+      - "traefik.http.routers.hybridragbot.rule=Host(`hybridragbot.sbs`)"
+      - "traefik.http.routers.hybridragbot.entrypoints=websecure"
+      - "traefik.http.routers.hybridragbot.tls=true"
+      - "traefik.http.routers.hybridragbot.tls.certresolver=letsencrypt"
+      - "traefik.http.services.hybridragbot.loadbalancer.server.port=8501"
+
 
     environment:
       BACKEND_URL: http://backend:8001
