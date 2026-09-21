@@ -1,0 +1,51 @@
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: hybrid-rag-backend
+
+    command: >
+      python -m uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8001
+
+    ports:
+      - "8001:8001"
+
+    env_file:
+      - .env
+
+    environment:
+      APP_ENV: production
+
+    volumes:
+      - ./data:/app/data
+
+    restart: unless-stopped
+
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: hybrid-rag-frontend
+
+    command: >
+      streamlit run /app/frontend/streamlit_app.py
+      --server.address=0.0.0.0
+      --server.port=8501
+
+    ports:
+      - "8501:8501"
+
+    environment:
+      BACKEND_URL: http://backend:8001
+
+    depends_on:
+      - backend
+
+    restart: unless-stopped
